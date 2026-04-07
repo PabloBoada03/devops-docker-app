@@ -1,0 +1,190 @@
+name: CI-CD
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: devops-docker-app
+  REGISTRY: docker.io
+
+jobs:
+  # ===== CI: build + tests + lint =====
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        # Baja el código del repo
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+        # Instala Python 3.12 para correr tests
+
+      - name: Install deps for tests
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r app/requirements.txt
+          pip install pytest
+        # Dependencias de aplicación + pytest
+
+      - name: Run unit tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          echo "PYTHONPATH=$PYTHONPATH"
+          pytest -q tests/ -vv
+
+      - name: Lint Dockerfile (hadolint)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+        continue-on-error: true
+        # Revisa buenas prácticas del Dockerfile
+
+  # ===== Build & Push imagen =====
+  build_and_push:
+    needs: ci
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.vars.outputs.version }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set VERSION/TAGS
+        id: vars
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+          if git describe --tags --abbrev=0 >/dev/null 2>&1; then
+            VERSION=$(git describe --tags --abbrev=0)
+          else
+            VERSION="0.0.0-${SHORT_SHA}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+        # Etiqueta la imagen con tag semántico si existe, si no usa el SHA corto
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+        # Autenticación segura en Docker Hub
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        # Permite builds multi-arquitectura si quisieras (amd64/arm64)
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and Push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.version }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+        # Construye y publica la imagen versionada y latest
+
+      - name: Scan image with Trivy
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@v0.35.0
+        with:
+          image-ref: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.version }}
+          format: 'table'
+          exit-code: '0'
+        # Escaneo de vulnerabilidades (ajusta exit-code a '1' para bloquear)
+
+  # ===== CD: despliegue remoto por SSH =====
+  
+
+  deploy:
+    needs: build_and_push
+    runs-on: ubuntu-latest
+    steps:
+      # Gate: ¿hay secrets?
+      - name: Gate deploy (check secrets)
+        id: gate
+        env:
+          HAS_HOST: ${{ secrets.SSH_HOST }}
+          HAS_USER: ${{ secrets.SSH_USER }}
+          HAS_KEY:  ${{ secrets.SSH_KEY }}
+        shell: bash
+        run: |
+          if [[ -n "$HAS_HOST" && -n "$HAS_USER" && -n "$HAS_KEY" ]]; then
+            echo "ok=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip deploy (no SSH secrets)
+        if: steps.gate.outputs.ok != 'true'
+        run: echo "No hay SSH_HOST/SSH_USER/SSH_KEY. Omitiendo deploy."
+
+      - name: Checkout
+        if: steps.gate.outputs.ok == 'true'
+        uses: actions/checkout@v4
+
+      # Reachability 22/tcp
+      - name: Check SSH reachability
+        if: steps.gate.outputs.ok == 'true'
+        id: reach
+        shell: bash
+        run: |
+          H="${{ secrets.SSH_HOST }}"
+          if timeout 5 bash -lc "echo >/dev/tcp/${H}/22"; then
+            echo "ok=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip deploy (host no accesible)
+        if: steps.gate.outputs.ok == 'true' && steps.reach.outputs.ok != 'true'
+        run: echo "Host ${{ secrets.SSH_HOST }} no accesible. Omitiendo deploy."
+
+      - name: Setup SSH
+        if: steps.gate.outputs.ok == 'true' && steps.reach.outputs.ok == 'true'
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_KEY }}
+
+      - name: Deploy via SSH
+        if: steps.gate.outputs.ok == 'true' && steps.reach.outputs.ok == 'true'
+        shell: bash
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
+          set -e
+          export DOCKERHUB_USERNAME=${{ secrets.DOCKERHUB_USERNAME }}
+          export TAG=${{ needs.build_and_push.outputs.version }}
+          export APP_PORT=${{ secrets.APP_PORT }}
+          mkdir -p /opt/devops-docker-app
+          cd /opt/devops-docker-app
+          cat > docker-compose.prod.yml << 'COMPOSE'
+          services:
+            web:
+              image: ${DOCKERHUB_USERNAME}/devops-docker-app:${TAG}
+              restart: unless-stopped
+              ports:
+                - "${APP_PORT:-8080}:8080"
+              healthcheck:
+                test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+                interval: 30s
+                timeout: 3s
+                retries: 3
+          COMPOSE
+          docker compose -f docker-compose.prod.yml pull
+          docker compose -f docker-compose.prod.yml up -d
+          docker ps
+          EOF
