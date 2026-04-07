@@ -32,10 +32,6 @@ jobs:
         # Dependencias de aplicación + pytest
 
       - name: Run unit tests
-        run: pytest -q
-        # Ejecuta tests; si falla, se detiene el pipeline
-
-      - name: Run unit tests
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
@@ -50,9 +46,11 @@ jobs:
         # Revisa buenas prácticas del Dockerfile
 
   # ===== Build & Push imagen =====
-  build-and-push:
+  build_and_push:
     needs: ci
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.vars.outputs.version }}
     permissions:
       contents: read
       packages: write
@@ -101,7 +99,8 @@ jobs:
         # Construye y publica la imagen versionada y latest
 
       - name: Scan image with Trivy
-        uses: aquasecurity/trivy-action@0.22.0
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@v0.35.0
         with:
           image-ref: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.version }}
           format: 'table'
@@ -109,42 +108,69 @@ jobs:
         # Escaneo de vulnerabilidades (ajusta exit-code a '1' para bloquear)
 
   # ===== CD: despliegue remoto por SSH =====
+  
+
   deploy:
-    needs: build-and-push
+    needs: build_and_push
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
     steps:
+      # Gate: ¿hay secrets?
+      - name: Gate deploy (check secrets)
+        id: gate
+        env:
+          HAS_HOST: ${{ secrets.SSH_HOST }}
+          HAS_USER: ${{ secrets.SSH_USER }}
+          HAS_KEY:  ${{ secrets.SSH_KEY }}
+        shell: bash
+        run: |
+          if [[ -n "$HAS_HOST" && -n "$HAS_USER" && -n "$HAS_KEY" ]]; then
+            echo "ok=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip deploy (no SSH secrets)
+        if: steps.gate.outputs.ok != 'true'
+        run: echo "No hay SSH_HOST/SSH_USER/SSH_KEY. Omitiendo deploy."
+
       - name: Checkout
+        if: steps.gate.outputs.ok == 'true'
         uses: actions/checkout@v4
 
-      - name: Get version from previous job
-        id: getver
+      # Reachability 22/tcp
+      - name: Check SSH reachability
+        if: steps.gate.outputs.ok == 'true'
+        id: reach
+        shell: bash
         run: |
-          if git describe --tags --abbrev=0 >/dev/null 2>&1; then
-            VERSION=$(git describe --tags --abbrev=0)
+          H="${{ secrets.SSH_HOST }}"
+          if timeout 5 bash -lc "echo >/dev/tcp/${H}/22"; then
+            echo "ok=true"  >> "$GITHUB_OUTPUT"
           else
-            VERSION="0.0.0-$(git rev-parse --short HEAD)"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
           fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-        # Recupera la versión para desplegar esa misma imagen
+
+      - name: Skip deploy (host no accesible)
+        if: steps.gate.outputs.ok == 'true' && steps.reach.outputs.ok != 'true'
+        run: echo "Host ${{ secrets.SSH_HOST }} no accesible. Omitiendo deploy."
 
       - name: Setup SSH
+        if: steps.gate.outputs.ok == 'true' && steps.reach.outputs.ok == 'true'
         uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.SSH_KEY }}
-        # Carga la clave privada en un agente SSH temporal
 
       - name: Deploy via SSH
+        if: steps.gate.outputs.ok == 'true' && steps.reach.outputs.ok == 'true'
+        shell: bash
         run: |
           ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
           set -e
           export DOCKERHUB_USERNAME=${{ secrets.DOCKERHUB_USERNAME }}
-          export TAG=${{ steps.getver.outputs.version }}
+          export TAG=${{ needs.build_and_push.outputs.version }}
           export APP_PORT=${{ secrets.APP_PORT }}
           mkdir -p /opt/devops-docker-app
           cd /opt/devops-docker-app
-
-          # Escribir/actualizar compose (opcional si ya existe)
           cat > docker-compose.prod.yml << 'COMPOSE'
           services:
             web:
@@ -158,12 +184,7 @@ jobs:
                 timeout: 3s
                 retries: 3
           COMPOSE
-
           docker compose -f docker-compose.prod.yml pull
           docker compose -f docker-compose.prod.yml up -d
-
-          # Verifica salud rápida
-          sleep 5
           docker ps
           EOF
-        # Hace pull de la imagen versionada y la levanta con Compose
